@@ -16,6 +16,7 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/dmapool.h>
+#include <linux/timer.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/uaccess.h>
@@ -30,7 +31,8 @@
 #define DRIVER_AUTHOR "Ryan Press <ryan@presslab.us>"
 #define DRIVER_DESC "USB FTDI MPSSE SPI/GPIO Driver"
 
-#define CONCURRENT_GPIO_WRITES 256
+#define GPIO_BUF_LEN 512
+#define CONCURRENT_GPIO_WRITES 8
 #define CONCURRENT_SPI_WRITES 6
 
 static __u16 vendor = FTDI_VID;
@@ -82,6 +84,7 @@ struct ftdi_device {
 	uint32_t		tclk;
 	struct mutex		usb_lock;
 	struct usb_anchor	urb_submitted;
+	struct timer_list	timer;
 
 	struct spi_bitbang	spi;
 	struct semaphore	spi_limit_sem;
@@ -89,9 +92,15 @@ struct ftdi_device {
 
 	struct gpio_chip	gpio;
 	struct semaphore	gpio_limit_sem;
-	struct dma_pool		*gpio_pool;
 	uint16_t		gpio_dirs;
 	uint16_t		gpio_pins;
+
+	spinlock_t		gpio_txlock;
+	uint8_t			*gpio_buf;
+	struct urb		*gpio_urb;
+	uint16_t		gpio_idx;
+	struct dma_pool		*gpio_pool;
+
 };
 
 
@@ -119,74 +128,135 @@ static void ftdi_gpio_bulk_callback(struct urb *urb)
 	up(&dev->gpio_limit_sem);
 }
 
-static int ftdi_gpio_common(struct ftdi_device *dev, enum ftdi_gpiocmds cmd)
+static int ftdi_gpio_tx(struct ftdi_device * dev)
 {
-	int err, len = 0;
-	struct urb *urb = NULL;
-	char *buf = NULL;
+	int err;
+	unsigned long flags;
 
-	if (down_interruptible(&dev->gpio_limit_sem) < 0)
-		return -EINTR;
+	spin_lock_irqsave(&dev->gpio_txlock, flags);
 
-	if (!(urb = usb_alloc_urb(0, GFP_KERNEL))) {
-		err = -ENOMEM;
-		goto error_no_buf;
+	if (dev->gpio_buf == NULL) {
+		spin_unlock_irqrestore(&dev->gpio_txlock, flags);
+		return 0;
 	}
 
-	/* alloc from the pool, size is 3 bytes */
-	if (!(buf = dma_pool_alloc(dev->gpio_pool, GFP_KERNEL, &urb->transfer_dma))) {
-		err = -ENOMEM;
-		goto error_pool;
-	}
+	del_timer(&dev->timer);
 
-	switch (cmd) {
-	case GPIOCMD_WRITE_HIGH:
-		len = 3;
-		buf[0] = FTDI_MPSSE_WRITEHIGH;
-		buf[1] = dev->gpio_pins >> 8;
-		buf[2] = dev->gpio_dirs >> 8;
-		break;
-	case GPIOCMD_WRITE_LOW:
-		len = 3;
-		buf[0] = FTDI_MPSSE_WRITELOW;
-		buf[1] = dev->gpio_pins;
-		buf[2] = dev->gpio_dirs;
-		break;
-	case GPIOCMD_READ_HIGH:
-		len = 1;
-		buf[0] = FTDI_MPSSE_READHIGH;
-		break;
-	case GPIOCMD_READ_LOW:
-		len = 1;
-		buf[0] = FTDI_MPSSE_READLOW;
-		break;
-	case GPIOCMD_WAIT_ON_L1HI:
-		len = 1;
-		buf[0] = FTDI_MPSSE_WAIT_ON_HI;
-		break;
-	case GPIOCMD_WAIT_ON_L1LO:
-		len = 1;
-		buf[0] = FTDI_MPSSE_WAIT_ON_LO;
-		break;
-	}
+	usb_fill_bulk_urb(dev->gpio_urb, dev->udev, usb_sndbulkpipe(dev->udev, dev->out_ep),
+		dev->gpio_buf, dev->gpio_idx, ftdi_gpio_bulk_callback, dev);
+	dev->gpio_urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
 
-	usb_fill_bulk_urb(urb, dev->udev, usb_sndbulkpipe(dev->udev, dev->out_ep),
-			buf, len, ftdi_gpio_bulk_callback, dev);
-	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+	dev->gpio_buf = NULL;
+	dev->gpio_idx = 0;
 
-	usb_anchor_urb(urb, &dev->urb_submitted);
-
-	if ((err = usb_submit_urb(urb, GFP_KERNEL))) {
+	if ((err = usb_submit_urb(dev->gpio_urb, GFP_ATOMIC))) {
 		dev_err(&dev->udev->dev, "%s - failed write urb, err %d", __func__, err);
-		goto error_unanchor;
+		goto error;
 	}
 
-	usb_free_urb(urb);
+	usb_free_urb(dev->gpio_urb);
+	spin_unlock_irqrestore(&dev->gpio_txlock, flags);
 	return 0;
 
-error_unanchor:
-	usb_unanchor_urb(urb);
-	dma_pool_free(dev->gpio_pool, buf, urb->transfer_dma);
+error:
+	dma_pool_free(dev->gpio_pool, dev->gpio_urb->transfer_buffer, dev->gpio_urb->transfer_dma);
+	usb_unanchor_urb(dev->gpio_urb);
+	usb_free_urb(dev->gpio_urb);
+
+	spin_unlock_irqrestore(&dev->gpio_txlock, flags);
+
+	up(&dev->gpio_limit_sem);
+	return err;
+}
+
+static void ftdi_gpio_timer(unsigned long data)
+{
+	struct ftdi_device *dev = (struct ftdi_device *)data;
+
+	/* when timer expires write whatever is in the buffer */
+	(void) ftdi_gpio_tx(dev);
+}
+
+static int ftdi_gpio_common(struct ftdi_device *dev, enum ftdi_gpiocmds cmd)
+{
+	int err = 0;
+	uint8_t *buf = NULL;
+	bool force = false;
+	struct urb *urb;
+	uint16_t idx;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->gpio_txlock, flags);
+	buf = dev->gpio_buf;
+	idx = dev->gpio_idx;
+
+	/* buffer is empty, so start the URB */
+	if (buf == NULL) {
+		spin_unlock_irqrestore(&dev->gpio_txlock, flags);
+
+		if (down_interruptible(&dev->gpio_limit_sem) < 0)
+			return -EINTR;
+
+		if (!(urb = usb_alloc_urb(0, GFP_KERNEL))) {
+			err = -ENOMEM;
+			goto error_no_buf;
+		}
+
+		/* alloc from the pool, size is GPIO_BUF_LEN bytes */
+		if (!(buf = dma_pool_alloc(dev->gpio_pool, GFP_KERNEL, &urb->transfer_dma))) {
+			err = -ENOMEM;
+			goto error_pool;
+		}
+
+		usb_anchor_urb(urb, &dev->urb_submitted);
+
+		spin_lock_irqsave(&dev->gpio_txlock, flags);
+
+		/* after 'latency_timer' ms, this timer will queue tx if it hasn't been written yet */
+		dev->timer.expires = jiffies + msecs_to_jiffies(latency_timer);
+		add_timer(&dev->timer);
+
+		dev->gpio_urb = urb;
+		dev->gpio_buf = buf;
+	}
+
+	/* add command to the buffer */
+	switch (cmd) {
+	case GPIOCMD_WRITE_HIGH:
+		buf[idx++] = FTDI_MPSSE_WRITEHIGH;
+		buf[idx++] = dev->gpio_pins >> 8;
+		buf[idx++] = dev->gpio_dirs >> 8;
+		break;
+	case GPIOCMD_WRITE_LOW:
+		buf[idx++] = FTDI_MPSSE_WRITELOW;
+		buf[idx++] = dev->gpio_pins;
+		buf[idx++] = dev->gpio_dirs;
+		break;
+	case GPIOCMD_READ_HIGH:
+		buf[idx++] = FTDI_MPSSE_READHIGH;
+		force = true;
+		break;
+	case GPIOCMD_READ_LOW:
+		buf[idx++] = FTDI_MPSSE_READLOW;
+		force = true;
+		break;
+	case GPIOCMD_WAIT_ON_L1HI:
+		buf[idx++] = FTDI_MPSSE_WAIT_ON_HI;
+		break;
+	case GPIOCMD_WAIT_ON_L1LO:
+		buf[idx++] = FTDI_MPSSE_WAIT_ON_LO;
+		break;
+	}
+
+	dev->gpio_idx = idx;
+	spin_unlock_irqrestore(&dev->gpio_txlock, flags);
+
+	/* if the buffer is almost full, or a read command, queue it up */
+	if (idx + 3 >= GPIO_BUF_LEN || force) {
+		return ftdi_gpio_tx(dev);
+	}
+
+	return 0;
 error_pool:
 	usb_free_urb(urb);
 error_no_buf:
@@ -205,10 +275,10 @@ static void ftdi_gpio_set_block(struct gpio_chip *gc, unsigned long mask, unsign
 	dev->gpio_pins &= ~(mask << gpio_offset);
 	dev->gpio_pins |= (values & mask) << gpio_offset;
 
-	if ((old_pins & 0xFF00) != (dev->gpio_pins & 0xFF00))
+	/* only write the pins if they have changed */
+	if ((old_pins ^ dev->gpio_pins) & 0xFF00)
 		(void) ftdi_gpio_common(dev, GPIOCMD_WRITE_HIGH);
-
-	if ((old_pins & 0xFF) != (dev->gpio_pins & 0xFF))
+	if ((old_pins ^ dev->gpio_pins) & 0xFF)
 		(void) ftdi_gpio_common(dev, GPIOCMD_WRITE_LOW);
 
 	mutex_unlock(&dev->usb_lock);
@@ -260,60 +330,53 @@ static int ftdi_gpio_dir_out(struct gpio_chip *gc, unsigned gpio_num, int val)
 	return err;
 }
 
+/* TODO: This sleeps */
 static unsigned long ftdi_gpio_get_block(struct gpio_chip *gc, unsigned long mask)
 {
 	unsigned long result = 0;
-	int err, cnt = 0;
+	int i, err, cnt = 0;
 	uint8_t *buf;
 
 	struct ftdi_device *dev = container_of(gc, struct ftdi_device, gpio);
 
+	if (!((mask << gpio_offset) & 0xFFFF))
+		return -EINVAL;
+
 	mutex_lock(&dev->usb_lock);
 
 	/* get DMA memory */
-	if ((buf = kzalloc(3, GFP_KERNEL)) == NULL)
+	if ((buf = kzalloc(4, GFP_KERNEL)) == NULL)
 		goto error_mem;
 
 	/* request gpio pins */
-	if ((mask << gpio_offset) & 0xFF00)
-		if ((err = ftdi_gpio_common(dev, GPIOCMD_READ_HIGH)))
-			goto error;
-	if ((mask << gpio_offset) & 0xFF)
-		if ((err = ftdi_gpio_common(dev, GPIOCMD_READ_LOW)))
-			goto error;
+	if ((err = ftdi_gpio_common(dev, GPIOCMD_READ_HIGH)))
+		goto error;
+	if ((err = ftdi_gpio_common(dev, GPIOCMD_READ_LOW)))
+		goto error;
 
-	/* wait for all writes to be processed */
-	/* TODO: This sleeps? */
+	/* wait for write to be processed */
 	if (!usb_wait_anchor_empty_timeout(&dev->urb_submitted, WDR_ANCHOR_TIMEOUT)) {
 		err = -ETIMEDOUT;
 		goto error;
 	}
 
 	/* read back pins */
-	if ((mask << gpio_offset) & 0xFF00) {
+	/* some chips send back a couple status-only packets */
+	/* first, so we loop until we get 4 bytes */
+	for (i = 0; i < 10; i ++) {
 		if ((err = usb_bulk_msg(dev->udev, usb_rcvbulkpipe(dev->udev, dev->in_ep),
-		buf, 3, &cnt, WDR_SHORT_TIMEOUT)))
+		buf, 4, &cnt, WDR_SHORT_TIMEOUT)))
 			goto error;
-
-		if (cnt < 3) {
-			err = -ENODATA;
-			goto error;
-		}
-		result = (buf[2] << 8) >> gpio_offset;
+		if (cnt >= 4) break;
 	}
 
-	if ((mask << gpio_offset) & 0xFF) {
-		if ((err = usb_bulk_msg(dev->udev, usb_rcvbulkpipe(dev->udev, dev->in_ep),
-		buf, 3, &cnt, WDR_SHORT_TIMEOUT)))
-			goto error;
-
-		if (cnt < 3) {
-			err = -ENODATA;
-			goto error;
-		}
-		result |= buf[2] >> gpio_offset;
+	if (cnt < 4) {
+		err = -ENODATA;
+		goto error;
 	}
 
+	result = (buf[2] << 8) >> gpio_offset;
+	result |= buf[3] >> gpio_offset;
 
 	kfree(buf);
 	mutex_unlock(&dev->usb_lock);
@@ -322,6 +385,7 @@ static unsigned long ftdi_gpio_get_block(struct gpio_chip *gc, unsigned long mas
 error:
 	kfree(buf);
 	mutex_unlock(&dev->usb_lock);
+	dev_warn(&dev->udev->dev, "%s - error %d", __func__, err);
 	return err;
 error_mem:
 	mutex_unlock(&dev->usb_lock);
@@ -331,14 +395,14 @@ error_mem:
 
 static int ftdi_gpio_get(struct gpio_chip *gc, unsigned gpio_num)
 {
-	int err;
+	int result;
 	struct ftdi_device *dev = container_of(gc, struct ftdi_device, gpio);
 
 	/* If module parameter set, tell MPSSE state machine to wait for level on GPIO L1 */
 	if (wait_on_l1 && gpio_num + gpio_offset == 5) {
 		mutex_lock(&dev->usb_lock);
-		if ((err = ftdi_gpio_common(dev, wait_on_l1[0] == 'l' ? GPIOCMD_WAIT_ON_L1LO : GPIOCMD_WAIT_ON_L1HI)))
-			return err;
+		if ((result = ftdi_gpio_common(dev, wait_on_l1[0] == 'l' ? GPIOCMD_WAIT_ON_L1LO : GPIOCMD_WAIT_ON_L1HI)))
+			return result;
 
 		mutex_unlock(&dev->usb_lock);
 
@@ -349,7 +413,10 @@ static int ftdi_gpio_get(struct gpio_chip *gc, unsigned gpio_num)
 			return 1;
 	}
 
-	return ftdi_gpio_get_block(gc, 1 << gpio_num) ? 1 : 0;
+	result = ftdi_gpio_get_block(gc, 1 << gpio_num);
+	if (result < 0) return result;
+
+	return (result & (1 << gpio_num)) ? 1 : 0;
 }
 
 
@@ -505,6 +572,9 @@ static int ftdi_spi_txrx(struct spi_device *spi, struct spi_transfer *t)
 	if (t->rx_buf != NULL)
 		buf[0] |= FTDI_MPSSE_SPI_READ;
 
+	/* finish tx of GPIO, if any */
+	ftdi_gpio_tx(dev);
+
 	usb_fill_bulk_urb(urb, dev->udev, usb_sndbulkpipe(dev->udev, dev->out_ep),
 			buf, t->len + 3, ftdi_spi_bulk_callback, dev);
 
@@ -528,7 +598,7 @@ static int ftdi_spi_txrx(struct spi_device *spi, struct spi_transfer *t)
 
 		/* read rx data from pipe, first 2 bytes are status */
 		if ((err = usb_bulk_msg(dev->udev, usb_rcvbulkpipe(dev->udev, dev->in_ep),
-	            buf, t->len + 2, &cnt, WDR_TIMEOUT)))
+			buf, t->len + 2, &cnt, WDR_TIMEOUT)))
 
 		if (cnt < 2) {
 			err = -ENODATA;
@@ -585,8 +655,8 @@ static int ftdi_probe(struct usb_interface * interface,
 	sema_init(&dev->gpio_limit_sem, CONCURRENT_GPIO_WRITES);
 	sema_init(&dev->spi_limit_sem, CONCURRENT_SPI_WRITES);
 
-	/* coherent DMA pool for gpio writes, each write is 3 bytes.  */
-	dev->gpio_pool = dma_pool_create(DRV_NAME, NULL, 3, 0, 0);
+	/* coherent DMA pool for gpio writes */
+	dev->gpio_pool = dma_pool_create(DRV_NAME, NULL, GPIO_BUF_LEN, 0, 0);
 	if (dev->gpio_pool == NULL) {
 		dev_err(&interface->dev, "can't request coherent pool\n");
 		goto error_pool;
@@ -597,6 +667,9 @@ static int ftdi_probe(struct usb_interface * interface,
 	dev->udev = usb_get_dev(udev);
 	dev->interface = interface->altsetting->desc.bInterfaceNumber;
 	mutex_init(&dev->usb_lock);
+	init_timer(&dev->timer);
+	dev->timer.function = ftdi_gpio_timer;
+	dev->timer.data = (unsigned long)dev;
 
 	usb_set_intfdata(interface, dev);
 
@@ -736,6 +809,7 @@ error_usb:
 	goto error;
 error:
 	usb_set_intfdata(interface, NULL);
+	dma_pool_destroy(dev->gpio_pool);
 	kfree(dev);
 
 	return err;
@@ -763,12 +837,15 @@ static void ftdi_disconnect(struct usb_interface *interface)
 		}
 
 		/* wait for all writes to be processed */
-		if (!usb_wait_anchor_empty_timeout(&dev->urb_submitted, WDR_ANCHOR_TIMEOUT))
+		if (!usb_wait_anchor_empty_timeout(&dev->urb_submitted, WDR_ANCHOR_TIMEOUT)) {
+			usb_poison_anchored_urbs(&dev->urb_submitted);
+			usb_wait_anchor_empty_timeout(&dev->urb_submitted, WDR_ANCHOR_TIMEOUT);
 			usb_kill_anchored_urbs(&dev->urb_submitted);
+		}
 
-		dma_pool_destroy(dev->gpio_pool);
 		usb_set_intfdata(interface, NULL);
 
+		dma_pool_destroy(dev->gpio_pool);
 		kfree(dev);
 	}
 
@@ -792,12 +869,12 @@ static int __init ftdi_init(void)
 		return -EINVAL;
 	}
 
-	if (spi_numcs > 1 && wait_on_l1) {
-		pr_err("only one CS with wait_on_l1");
+	if (spi_numcs > 2 && wait_on_l1) {
+		pr_err("max two CS with wait_on_l1");
 		return -EINVAL;
 	}
 
-	if (wait_on_l1 && (wait_on_l1[0] != 'l' || wait_on_l1[0] != 'h')) {
+	if (wait_on_l1 && ((wait_on_l1[0] != 'l' && wait_on_l1[0] != 'h') || wait_on_l1[1] != 0)) {
 		pr_err("wait_on_l1 must be unset, \'l\', or \'h\'");
 		return -EINVAL;
 	}
